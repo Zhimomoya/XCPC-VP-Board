@@ -14,9 +14,13 @@ XCPC Board 是给 ICPC / CCPC 队伍做 VP（虚拟参赛）的本地榜单。�
 
 ### 2. 启动榜单服务
 
-**Windows**：在文件资源管理器里右键 [`start-silent.ps1`](start-silent.ps1)，选择 **使用 PowerShell 运行**。服务在后台运行。要停止时，同样右键 [`stop-silent.ps1`](stop-silent.ps1) 并选择 **使用 PowerShell 运行**。
+#### Windows
 
-**Ubuntu / WSL**：在项目目录打开终端，运行 [`start-ubuntu.sh`](start-ubuntu.sh)。保持终端打开，按 `Ctrl+C` 停止服务。
+在文件资源管理器里右键 [`start-silent.ps1`](start-silent.ps1)，选择 **使用 PowerShell 运行**。服务在后台运行。要停止时，同样右键 [`stop-silent.ps1`](stop-silent.ps1) 并选择 **使用 PowerShell 运行**。
+
+#### Ubuntu / WSL
+
+在项目目录打开终端，运行 [`start-ubuntu.sh`](start-ubuntu.sh)。保持终端打开，按 `Ctrl+C` 停止服务。
 
 ```bash
 bash start-ubuntu.sh
