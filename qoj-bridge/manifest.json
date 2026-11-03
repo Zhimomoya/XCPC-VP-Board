@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "XCPC VP QOJ 同步",
+  "version": "0.5.21",
+  "description": "沿用浏览器 QOJ 登录会话同步本队提交，并按用户操作向 QOJ 提交源码。",
+  "permissions": ["storage", "tabs", "scripting"],
+  "host_permissions": ["https://qoj.ac/*", "https://*.qoj.ac/*", "https://pjudge.ac/*", "http://*/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [
+    {"matches": ["https://qoj.ac/*", "https://*.qoj.ac/*", "https://pjudge.ac/*"], "js": ["qoj-response.js", "qoj-account.js", "vp-start.js", "content.js"]},
+    {"matches": ["http://127.0.0.1/*", "http://localhost/*"], "js": ["qoj-response.js", "qoj-account.js", "local-qoj.js", "content.js", "submit-bridge.js"]}
+  ],
+  "action": {"default_popup": "popup.html"}
+}

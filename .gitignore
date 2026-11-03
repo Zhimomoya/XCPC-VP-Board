@@ -1,0 +1,22 @@
+# Local contests, session state, submissions, source code, and logs.
+/data/
+
+# Browser test profiles, development output, and dependency caches.
+/tmp/
+/output/
+/.npm-cache/
+/node_modules/
+
+# Python caches and local environments.
+__pycache__/
+*.py[cod]
+/.venv/
+/venv/
+
+# Local settings and desktop metadata.
+.env
+.env.*
+*.log
+*.pid
+.DS_Store
+Thumbs.db

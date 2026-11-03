@@ -1,0 +1,22 @@
+{
+  "config": {
+    "contest_name": "ICPC 本地导入示例",
+    "start_time": "2024-01-02T08:00:00+08:00",
+    "end_time": "2024-01-02T13:00:00+08:00",
+    "penalty": 1200,
+    "frozen_time": 3600,
+    "medal": false,
+    "problems": [{"id": "p1", "label": "A"}],
+    "options": {
+      "submission_timestamp_unit": "second",
+      "calculation_of_penalty": "in_minutes"
+    }
+  },
+  "team": [
+    {"id": "team1", "name": "示例队伍", "organization": "示例学校", "group": ["official"]}
+  ],
+  "run": [
+    {"id": "1", "team_id": "team1", "problem_id": "p1", "timestamp": 60, "status": "WRONG_ANSWER"},
+    {"id": "2", "team_id": "team1", "problem_id": "p1", "timestamp": 120, "status": "CORRECT"}
+  ]
+}
