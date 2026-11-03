@@ -1,6 +1,7 @@
 """Local VP scoreboard server. No third-party packages required."""
 from __future__ import annotations
 
+import errno
 import json
 import ipaddress
 import re
@@ -1469,14 +1470,20 @@ class Handler(BaseHTTPRequestHandler):
                 with STATE_LOCK:
                     active = session()
                     now = now_ms()
-                    rows = expire_submission_attempts(active["session_id"], read_json(SUBMISSION_FILE, []), now=now) if active else []
-                    submit_ids = [r["qoj_id"] for r in rows if r.get("from_submit") and r.get("qoj_id")]
+                    local = self._local_client()
+                    viewer_id = None if local else query.get("viewer_session_id", [None])[0]
+                    viewer_matches = active is not None and viewer_id == active["session_id"]
+                    rows = (expire_submission_attempts(active["session_id"], read_json(SUBMISSION_FILE, []), now=now)
+                            if active and (viewer_id is None or viewer_matches) else [])
+                    submit_ids = [r["qoj_id"] for r in rows if r.get("from_submit") and r.get("qoj_id")] if viewer_id is None else []
                     submit_refs = [{"id": r["qoj_id"], "problem": r["problem"]} for r in rows
-                                   if r.get("from_submit") and r.get("qoj_id") and (r.get("time_provisional") or r.get("status") in ("awaiting_sync", "pending") or r.get("qoj_status") == "pending")] if self._local_client() else []
+                                   if r.get("from_submit") and r.get("qoj_id") and (r.get("time_provisional") or r.get("status") in ("awaiting_sync", "pending") or r.get("qoj_status") == "pending")] if local else []
                     pending_refs = [{key: r[key] for key in ("id", "problem", "submitted_at_ms", "contest_time_seconds", "time_source", "status") if key in r}
                                     for r in rows if not r.get("from_submit") and r.get("status") == "pending"
-                                    and re.fullmatch(r"\d{1,15}", str(r.get("id", "")))][:500] if self._local_client() else []
-                    value = {"session": active, "submit_ids": submit_ids, "submit_refs": submit_refs, "pending_refs": pending_refs, "submission_window": submission_window(active, now), "can_manage": self._local_client(), "permissions": self._permissions(), "server_time_ms": now, "clock": CLOCK.status()}
+                                    and re.fullmatch(r"\d{1,15}", str(r.get("id", "")))][:500] if local else []
+                    value = {"session": active, "submit_ids": submit_ids, "submit_refs": submit_refs, "pending_refs": pending_refs, "submission_window": submission_window(active, now), "can_manage": local, "permissions": self._permissions(), "server_time_ms": now, "clock": CLOCK.status()}
+                    if viewer_matches:
+                        value["submissions"] = rows
                 return self._json(value)
             if parsed.path in ("/api/home", "/api/analysis"):
                 with STATE_LOCK:
@@ -1679,6 +1686,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, 400)
 
 
+class ScoreboardServer(ThreadingHTTPServer):
+    allow_reuse_port = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -1686,11 +1703,20 @@ if __name__ == "__main__":
     parser.add_argument("--lan", action="store_true", help="also listen on the local network")
     parser.add_argument("--debug", action="store_true", help="enable host-only contest time controls")
     args = parser.parse_args()
-    CLOCK.start()
     LAN_ENABLED = args.lan
     DEBUG_ENABLED = args.debug
     host = "0.0.0.0" if args.lan else HOST
-    print(f"Open http://{HOST}:{args.port}", flush=True)
+    if not 0 <= args.port <= 65535:
+        parser.error("--port 须为 0 至 65535 之间的端口号")
+    try:
+        httpd = ScoreboardServer((host, args.port), Handler)
+    except OSError as exc:
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES) or getattr(exc, "winerror", None) in (10048, 10013):
+            parser.error(f"无法监听 {host}:{args.port}，端口已被占用或系统禁止使用。"
+                         "若榜单已启动，请使用现有服务；否则可指定另一个端口，例如 --port 8870。")
+        raise
+    CLOCK.start()
+    print(f"Open http://{HOST}:{httpd.server_port}", flush=True)
     print(f"Project root: {ROOT}", flush=True)
     try:
         downloaded_count = len(list_contests())
@@ -1702,7 +1728,8 @@ if __name__ == "__main__":
     if args.lan:
         addresses = lan_addresses()
         for address in addresses:
-            print(f"LAN viewers: http://{address}:{args.port}", flush=True)
+            print(f"LAN viewers: http://{address}:{httpd.server_port}", flush=True)
         if not addresses:
             print("LAN enabled. Use this computer's private IPv4 address.", flush=True)
-    ThreadingHTTPServer((host, args.port), Handler).serve_forever()
+    with httpd:
+        httpd.serve_forever()

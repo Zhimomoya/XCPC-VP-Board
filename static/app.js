@@ -8,6 +8,7 @@ let liveStandingsCache=null;
 let lastStandingsView=null;
 let renderFrame=0,resumeTimer=0,resumeRefresh=null,clockTickTimer=0;
 const pendingReads=new Map();
+const pagePolls=new Set();
 const pageIsVisible=()=>typeof document==='undefined'||!document.hidden;
 if(typeof window!=='undefined')window.addEventListener('scroll',()=>{
   if(!pageIsVisible())return;
@@ -21,24 +22,25 @@ if(typeof window!=='undefined')window.addEventListener('scroll',()=>{
 },{passive:true,capture:true});
 const ownId='__vp_team__';
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const api=(url,options={})=>{
+const api=(url,{pagePoll=false,...options}={})=>{
   const read=(options.method||'GET').toUpperCase()==='GET',shared=read&&!options.signal;
   if(shared&&pendingReads.has(url))return pendingReads.get(url);
   const request=(async()=>{
     const controller=read&&!options.signal?new AbortController():null;
+    if(pagePoll&&controller)pagePolls.add(controller);
     const timeout=/^\/api\/(session|submissions|submission-sync-status|debug-time|qoj-vp-observation|qoj-contest-info)(?:\?|$)/.test(url)?8000:45000;
     const timer=controller?setTimeout(()=>controller.abort(),timeout):null;
     try{
       const response=await fetch(url,{cache:'no-store',...options,...(controller?{signal:controller.signal}:{})});
       const body=await response.json();if(!response.ok){const error=Error(body.error||response.statusText);error.status=response.status;throw error}return body;
     }catch(error){if(controller?.signal.aborted)throw Error('与主机连接超时，正在重试');throw error}
-    finally{if(timer!==null)clearTimeout(timer)}
+    finally{if(timer!==null)clearTimeout(timer);if(pagePoll)pagePolls.delete(controller)}
   })();
   if(shared){pendingReads.set(url,request);const clear=()=>{if(pendingReads.get(url)===request)pendingReads.delete(url)};request.then(clear,clear)}
   return request;
 };
 const post=(url,body,options={})=>api(url,{...options,method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-const matchSubmissions=sessionId=>api('/api/submissions'+(sessionId?'?session_id='+encodeURIComponent(sessionId):''));
+const matchSubmissions=(sessionId,options)=>api('/api/submissions'+(sessionId?'?session_id='+encodeURIComponent(sessionId):''),options);
 const requestUuid=()=>{
   if(typeof crypto.randomUUID==='function')return crypto.randomUUID();
   const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;
@@ -52,8 +54,9 @@ const steadyNow=()=>globalThis.performance?.now?.()??Date.now();
 let serverClockEpochMs=Date.now(),serverClockSteadyMs=steadyNow();
 // Anchor host time to elapsed time: OS clock corrections must not move a match.
 const serverNow=()=>serverClockEpochMs+(steadyNow()-serverClockSteadyMs);
-async function readSession(){
-  const sent=steadyNow(),response={...await api('/api/session')},received=steadyNow();
+async function readSession(viewerSessionId=null){
+  const url=viewerSessionId?'/api/session?viewer_session_id='+encodeURIComponent(viewerSessionId):'/api/session';
+  const sent=steadyNow(),response={...await api(url,{pagePoll:Boolean(viewerSessionId)})},received=steadyNow();
   if(received-sent<=8000&&response.server_time_ms!=null&&Number.isFinite(Number(response.server_time_ms))){
     serverClockEpochMs=Number(response.server_time_ms)+Math.max(0,received-sent)/2;
     serverClockSteadyMs=received;
@@ -76,7 +79,8 @@ const statusType=value=>{const s=String(value||'').toUpperCase();if(['CORRECT','
 const nameOf=value=>value&&typeof value==='object'?(value.texts?.['zh-CN']||value['zh-CN']||value.fallback||value.texts?.en||value.en||Object.values(value.texts||{})[0]||''):String(value??'');
 const hash=value=>{let h=2166136261;for(const c of String(value)){h^=c.charCodeAt(0);h=Math.imul(h,16777619)}return h>>>0};
 const sourceUrl=path=>`https://board.xcpcio.com/data/${path}/config.json`;
-const sortRuns=runs=>runs.sort((a,b)=>a.time-b.time||String(a.id).localeCompare(String(b.id)));
+const compareRuns=(a,b)=>a.time-b.time||String(a.id).localeCompare(String(b.id));
+const sortRuns=runs=>runs.sort(compareRuns);
 const compareRows=(a,b)=>a.sortorder-b.sortorder||b.solved-a.solved||a.penalty-b.penalty||a.lastAccepted-b.lastAccepted||a.name.localeCompare(b.name);
 
 function normalize(raw,contestPath=''){
@@ -224,24 +228,31 @@ function addAcceptedPenalty(row,time,wrong,data){
   else row.penalty+=contestMinute(seconds);
 }
 const formatPenalty=value=>Number.isInteger(value)?String(value):Number(value.toFixed(2)).toString();
-function compute(data,history,submissions,session,elapsed,revealFrozen=false){
+function* mergeRuns(history,own){
+  let i=0,j=0;
+  while(i<history.length&&j<own.length)yield compareRuns(history[i],own[j])<=0?history[i++]:own[j++];
+  while(i<history.length)yield history[i++];
+  while(j<own.length)yield own[j++];
+}
+function compute(data,history,submissions,session,elapsed,revealFrozen=false,historySorted=false){
   const mode=session.mode,freeze=Math.max(0,data.duration-(mode==='ccpc'?3600:Number(data.config.frozen_time??3600)));
   const observationTime=Math.max(0,elapsed),time=Math.min(data.duration,observationTime);
   const frozen=freeze<data.duration&&time>=freeze&&!session.revealed_at_ms&&!revealFrozen;
-  const scoreTime=frozen?freeze:time;
   const allTeams=[...data.teams,{id:ownId,name:session.own_name,organization:'本次 VP',group:['unofficial'],sortorder:0}];
   const rows=new Map(allTeams.map(t=>[t.id,{...t,solved:0,penalty:0,lastAccepted:-1,states:new Map()}]));
   const firstSolve=new Map(),accepted=new Map(data.problems.map(p=>[p.id,new Set()]));
-  const teamRuns=ownRuns(data,submissions,session),allRuns=sortRuns([...history,...teamRuns]);
+  const teamRuns=ownRuns(data,submissions,session);
+  const allRuns=historySorted?(teamRuns.length?mergeRuns(history,sortRuns(teamRuns)):history):sortRuns([...history,...teamRuns]);
+  // Historical VP verdicts may have been observed after the contest ended.
+  const finalPublished=Boolean(session.revealed_at_ms)&&observationTime>=data.duration;
   for(const run of allRuns){
-    if(run.time>=data.duration||run.time>scoreTime||frozen&&run.time>=freeze)break;
+    if(run.time>=data.duration||run.time>time)break;
     const row=rows.get(run.team);if(!row||!accepted.has(run.problem))continue;
     const cell=row.states.get(run.problem)||{attempts:0,pending:0,accepted:null,first:run.time};
     if(cell.accepted!==null)continue;
-    // judged_at_ms records when this local service observed the verdict. For a
-    // historical VP that can be days after the contest, so a published final
-    // board must use the known formal verdict instead of replaying it as pending.
-    const finalPublished=Boolean(session.revealed_at_ms)&&observationTime>=data.duration;
+    if(frozen&&run.time>=freeze){
+      cell.frozen=(cell.frozen||0)+1;row.states.set(run.problem,cell);continue;
+    }
     const status=finalPublished?run.status:(run.resultTime!==undefined&&run.resultTime>observationTime)?'pending':run.status;
     if(status==='correct'){
       cell.accepted=run.time;row.solved++;addAcceptedPenalty(row,run.time,cell.attempts,data);
@@ -251,15 +262,6 @@ function compute(data,history,submissions,session,elapsed,revealFrozen=false){
     else if(status==='incorrect')cell.attempts++;
     else continue;
     row.states.set(run.problem,cell);
-  }
-  if(frozen){
-    for(const run of allRuns){
-      if(run.time<freeze||run.time>=data.duration||run.time>time)continue;
-      const row=rows.get(run.team),cell=row?.states.get(run.problem);
-      if(!row||!accepted.has(run.problem)||cell?.accepted!==null&&cell?.accepted!==undefined)continue;
-      const next=cell||{attempts:0,pending:0,accepted:null,first:run.time};
-      next.frozen=(next.frozen||0)+1;row.states.set(run.problem,next);
-    }
   }
   const threshold=Math.min(50,Math.floor(data.teams.length*.2));
   const visible=new Set(mode==='icpc'||time>=freeze?data.problems.map(p=>p.id):data.problems.filter(p=>accepted.get(p.id).size>=threshold).map(p=>p.id));
@@ -282,8 +284,8 @@ function liveStandings(data,history,submissions,session,elapsed){
   const ownKey=ownRuns(data,submissions,session).map(run=>`${run.id}:${run.problem}:${run.time}:${run.status}:${run.time<=time?1:0}:${run.resultTime<=elapsed?1:0}`).join('|');
   const key=`${session.session_id}:${session.mode}:${session.own_name}:${session.start_at_ms}:${Boolean(session.revealed_at_ms)}:${time>=freeze}:${time>=data.duration}:${low}:${ownKey}`;
   if(!liveStandingsCache||liveStandingsCache.data!==data||liveStandingsCache.history!==history||liveStandingsCache.key!==key){
-    const result=compute(data,history,submissions,session,elapsed);
-    const ownLive=result.frozen?compute(data,history,submissions,session,elapsed,true).ordered.find(row=>row.id===ownId):null;
+    const result=compute(data,history,submissions,session,elapsed,false,true);
+    const ownLive=result.frozen?compute({...data,teams:[]},[],submissions,session,elapsed,true,true).ordered[0]:null;
     liveStandingsCache={data,history,key,result,ownLive};
   }
   // Phase labels still follow time between submission events and at the deadline.
@@ -770,7 +772,8 @@ function boardRefreshInterval(teamCount=state.data?.teams?.length||0){
   return teamCount>=1200?10_000:teamCount>=600?7_000:5_000;
 }
 
-function largeScoreboard(){return(state.data?.teams?.length||0)>=600}
+const virtualTeamThreshold=400;
+function largeScoreboard(){return(state.data?.teams?.length||0)>=virtualTeamThreshold}
 
 function patchHtml(element,html){
   if(element.__xcpcHtml===html)return;
@@ -819,16 +822,16 @@ function patchScoreboardRows(rows,data,result,session,virtualOnly=false){
     patchHtml(tbody,`<tr><td class="empty" colspan="${data.problems.length+4}">没有匹配的队伍</td></tr>`);
     return;
   }
-  const virtual=data.teams.length>=1200;
+  const virtual=rows.length>=virtualTeamThreshold;
   if(virtual&&!virtualOnly)virtualBoardState={rows,data,result,session,tableTop:tbody.getBoundingClientRect().top+window.scrollY,rangeKey:''};
   if(!virtual)virtualBoardState=null;
   tbody.dataset.totalRows=String(rows.length);
   let shownRows=rows,topHeight=0,bottomHeight=0;
   if(virtual&&typeof window!=='undefined'){
-    const rowHeight=56,overscan=30,batchSize=60,tbodyTop=virtualBoardState?.tableTop??(tbody.getBoundingClientRect().top+window.scrollY);
+    const rowHeight=56,overscan=20,batchSize=40,tbodyTop=virtualBoardState?.tableTop??(tbody.getBoundingClientRect().top+window.scrollY);
     const relativeTop=Math.max(0,window.scrollY-tbodyTop);
     const firstVisible=Math.floor(relativeTop/rowHeight),visibleCount=Math.ceil(window.innerHeight/rowHeight);
-    const start=Math.max(0,Math.floor(Math.max(0,firstVisible-overscan)/batchSize)*batchSize);
+    const start=Math.min(Math.floor(Math.max(0,firstVisible-overscan)/batchSize)*batchSize,Math.max(0,rows.length-visibleCount-overscan));
     const end=Math.min(rows.length,start+visibleCount+overscan*2+batchSize);
     const rangeKey=`${start}:${end}`;
     if(virtualOnly&&virtualBoardState?.rangeKey===rangeKey)return;
@@ -848,18 +851,18 @@ function patchScoreboardRows(rows,data,result,session,virtualOnly=false){
     else tbody.insertBefore(node,cursor);
   }
   for(const node of [...tbody.children])if(!keep.has(node))node.remove();
-  if(virtual&&scoreboardRows.size>600){
+  if(data.teams.length>=virtualTeamThreshold&&scoreboardRows.size>240){
     const visibleIds=new Set(shownRows.map(row=>row.id));
     for(const id of scoreboardRows.keys()){
-      if(scoreboardRows.size<=600)break;
+      if(scoreboardRows.size<=240)break;
       if(!visibleIds.has(id))scoreboardRows.delete(id);
     }
   }
 }
 
 function requestRender(){
-  if(!pageIsVisible()||renderFrame)return;
-  renderFrame=requestAnimationFrame(()=>{renderFrame=0;render()});
+  if(!pageIsVisible()||renderFrame||resumeTimer||resumeRefresh)return;
+  renderFrame=requestAnimationFrame(()=>{renderFrame=0;if(!resumeTimer&&!resumeRefresh)render()});
 }
 
 function renderMatchMetadata(data,session){
@@ -886,7 +889,7 @@ function render(){
   if(state.screen!=='match'||!state.data||!state.session)return;
   const quietFor=scrollQuietUntil-performance.now();
   if(state.view==='scoreboard'&&largeScoreboard()&&quietFor>0){
-    if(!deferredRenderTimer)deferredRenderTimer=setTimeout(()=>{deferredRenderTimer=0;render()},Math.ceil(quietFor)+20);
+    if(!deferredRenderTimer)deferredRenderTimer=setTimeout(()=>{deferredRenderTimer=0;requestRender()},Math.ceil(quietFor)+20);
     return;
   }
   if(deferredRenderTimer){clearTimeout(deferredRenderTimer);deferredRenderTimer=0}
@@ -899,39 +902,36 @@ function render(){
     return;
   }
   const {result,ownLive,revision}=liveStandings(data,state.history,state.submissions,session,elapsed);
-  const filter=$('search').value.trim().toLowerCase(),group=$('groupFilter').value;
-  if(state.view==='scoreboard'&&lastStandingsView?.revision===revision&&lastStandingsView.filter===filter&&lastStandingsView.group===group){lastBoardRenderAt=performance.now();return}
-  const displayRows=(ownLive?result.ordered.map(row=>row.id===ownId?ownLive:row):result.ordered).sort(compareRows);
-  let totalRank=0;
-  for(const row of displayRows)row.displayRankLabel=row.starred?'*':String(++totalRank);
-  const ownRow=displayRows.find(row=>row.id===ownId),projectedRank=projectedOfficialRank(displayRows,ownRow);
-  if(ownRow)ownRow.displayRankLabel=`*(${projectedRank})`;
+  const ownRow=ownLive||result.ordered.find(row=>row.id===ownId);
   if(state.view==='home'){
-    renderHome(data,session,result,ownRow?.displayRankLabel||'*',ownRow);
+    renderHome(data,session,result,ownRow?`*(${projectedOfficialRank(result.ordered,ownRow)})`:'*',ownRow);
     lastBoardRenderAt=performance.now();
     return;
   }
+  const filter=$('search').value.trim().toLowerCase(),group=$('groupFilter').value;
+  if(lastStandingsView?.revision===revision&&lastStandingsView.filter===filter&&lastStandingsView.group===group){lastBoardRenderAt=performance.now();return}
+  const displayRows=ownLive?result.ordered.map(row=>row.id===ownId?ownLive:row).sort(compareRows):result.ordered;
+  let totalRank=0;
+  for(const row of displayRows)row.displayRankLabel=row.starred?'*':String(++totalRank);
+  if(ownRow)ownRow.displayRankLabel=`*(${projectedOfficialRank(result.ordered,ownRow)})`;
   const visibleProblems=data.problems.filter(p=>result.visible.has(p.id));
   const headings=session.mode==='ccpc'&&result.time<result.freeze?[...visibleProblems,...Array(data.problems.length-visibleProblems.length).fill(null)]:data.problems;
   patchHtml($('thead'),`<tr><th class="rank">RANK</th><th class="team">TEAM</th><th class="score" colspan="2">SCORE</th>${headings.map(p=>`<th class="problem"><span class="${p?'':'unknown'}"${problemBadgeStyle(p)}>${escapeHtml(p?.label||'?')}</span></th>`).join('')}</tr>`);
-  const filtered=displayRows.filter(row=>{
+  const matchesFilter=row=>{
     if(group==='own'&&row.id!==ownId)return false;
     if(group!=='all'&&group!=='own'&&!row.group.includes(group))return false;
     return !filter||(row.name+' '+row.organization).toLowerCase().includes(filter);
-  });
-  const filteredPublic=result.ordered.filter(row=>{
-    if(group==='own'&&row.id!==ownId)return false;
-    if(group!=='all'&&group!=='own'&&!row.group.includes(group))return false;
-    return !filter||(row.name+' '+row.organization).toLowerCase().includes(filter);
-  });
+  };
+  const filtered=displayRows.filter(matchesFilter),filteredPublic=ownLive?result.ordered.filter(matchesFilter):filtered;
   patchScoreboardRows(filtered,data,result,session);
   patchHtml($('statsFoot'),`<tr class="stats-row"><th colspan="4">SUMMARY</th>${headings.map(p=>{
     if(!p)return'<td class="stats-hidden"></td>';
-    const cells=filteredPublic.map(row=>row.states.get(p.id)).filter(Boolean);
-    const solved=cells.filter(cell=>cell.accepted!==null).length;
-    const wrong=cells.reduce((sum,cell)=>sum+cell.attempts,0);
-    const pending=cells.reduce((sum,cell)=>sum+cell.pending+(cell.frozen||0),0);
-    const first=Math.min(...cells.filter(cell=>cell.accepted!==null).map(cell=>cell.accepted));
+    let solved=0,wrong=0,pending=0,first=Infinity;
+    for(const row of filteredPublic){
+      const cell=row.states.get(p.id);if(!cell)continue;
+      if(cell.accepted!==null){solved++;first=Math.min(first,cell.accepted)}
+      wrong+=cell.attempts;pending+=cell.pending+(cell.frozen||0);
+    }
     return`<td class="problem stats-cell"><div title="通过队伍数">✓ ${solved}</div><div title="错误提交数">✕ ${wrong}</div><div title="待判或封榜提交数">? ${pending}</div><div title="首解时间">◷ ${Number.isFinite(first)?contestMinute(first)+' min':'n/a'}</div></td>`;
   }).join('')}</tr>`);
   $('contestPhase').textContent=session.revealed_at_ms?'最终榜单已公布':state.archiveId?(result.time>=data.duration?'历史比赛 · 榜单待公布':result.frozen?'历史比赛 · 榜单封榜中':'历史比赛 · 比赛进行中'):result.time>=data.duration?'比赛结束 · 榜单待解冻':result.frozen?'榜单封榜中':'比赛进行中';
@@ -1099,6 +1099,17 @@ async function refreshHistory(){
     $('historyList').innerHTML=entries.map(entry=>`<article class="history-item"><div class="history-copy"><strong>${escapeHtml(entry.name)}</strong><small>${escapeHtml(formatBeijing(entry.start_at_ms))} · ${escapeHtml(entry.mode.toUpperCase())} · ${escapeHtml(scenarioName(entry.scenario))} · QOJ #${escapeHtml(entry.qoj_contest_id||'未知')} · ${entry.submission_count} submissions</small></div><div class="history-actions"><button class="secondary compact" type="button" data-history-id="${escapeHtml(entry.id)}">查看</button>${state.canManage?`<button class="secondary compact" type="button" data-history-activate="${escapeHtml(entry.id)}" data-history-name="${escapeHtml(entry.name)}">设为当前</button><button class="history-delete" type="button" data-history-delete="${escapeHtml(entry.id)}" data-history-name="${escapeHtml(entry.name)}">删除</button>`:''}</div></article>`).join('')||'<span class="history-empty">暂无历史比赛</span>';
   }catch(error){$('historyList').innerHTML=`<span class="history-empty">历史记录读取失败：${escapeHtml(error.message)}</span>`}
 }
+async function refreshLanInfo(includeSettings=false){
+  if(!state.canManage)return;
+  try{
+    const host=await api('/api/host-info');
+    const urls=host.lan_urls||[];
+    patchHtml($('lanInfo'),!host.lan_enabled?'未开启局域网访问；以 <code>python server.py --lan</code> 启动。':urls.length?
+      urls.map(url=>`<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>`).join('<br>'):
+      '局域网已开启，暂未检测到可共享的 IPv4 地址。');
+    if(includeSettings)renderLanSettings(host.lan_settings);
+  }catch(error){patchHtml($('lanInfo'),'无法读取主机地址：'+escapeHtml(error.message))}
+}
 async function refreshSession(){
   const response=await readSession();state.canManage=response.can_manage;state.session=response.session;
   if(!response.can_manage)return response.session;
@@ -1114,13 +1125,7 @@ async function refreshSession(){
   const clock=state.clockStatus,offset=Math.round(Math.abs(Number(clock?.system_offset_ms||0))/1000);
   $('clockInfo').textContent=clock?.synchronized?`榜单时钟：标准北京时间${offset>=2?`（已校正系统偏差 ${offset} 秒）`:''}`:'榜单时钟：稳定本机时钟（暂未取得网络标准时间）';
   $('clockInfo').classList.toggle('warning',!clock?.synchronized);
-  if(response.can_manage){
-    try{
-      const host=await api('/api/host-info');
-      $('lanInfo').innerHTML=host.lan_enabled&&host.lan_urls.length?host.lan_urls.map(url=>`<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(url)}</a>`).join('<br>'):'未开启局域网访问；以 <code>python server.py --lan</code> 启动。';
-      renderLanSettings(host.lan_settings);
-    }catch(error){$('lanInfo').textContent='无法读取主机地址：'+error.message}
-  }else $('lanInfo').textContent='你正在队友设备上查看榜单。';
+  await refreshLanInfo(true);
   await refreshHistory();
   return response.session;
 }
@@ -1266,21 +1271,21 @@ async function refreshVpObservation(){
   try{state.qojObservation=(await api('/api/qoj-vp-observation')).observation;renderVpObservation();if(waitingSince)tryWaitingLaunch()}
   catch(error){$('qojObservation').textContent='读取 VP 识别结果失败：'+error.message}
 }
-async function enterMatch(){
-  const session=await refreshSession();if(!session)throw Error('当前没有已启动的比赛');
-  if(session.start_at_ms>serverNow()){enterScheduledWaiting(session);return}
-  state.archiveId=null;state.data=normalize(await api('/api/contest?path='+encodeURIComponent(session.path)),session.path);
-  state.history=session.scenario==='adjusted'?adjustedRuns(state.data):state.data.runs;
-  state.submissions=await matchSubmissions(session.session_id);
-  state.syncHealth=state.canManage?(await api('/api/submission-sync-status')).sync:null;state.syncReadError='';
-  state.debug=state.canManage?await api('/api/debug-time'):{enabled:false,elapsed_seconds:null};
+async function enterMatch(knownSession=null){
+  const session=knownSession||await refreshSession();if(!session)throw Error('当前没有已启动的比赛');
+  if(session.start_at_ms>serverNow()){state.session=session;enterScheduledWaiting(session);return}
+  const [raw,submissions]=await Promise.all([api('/api/contest?path='+encodeURIComponent(session.path)),matchSubmissions(session.session_id)]);
+  const data=normalize(raw,session.path),history=session.scenario==='adjusted'?adjustedRuns(data):data.runs;
+  const syncHealth=state.canManage?(await api('/api/submission-sync-status')).sync:null;
+  const debug=state.canManage?await api('/api/debug-time'):{enabled:false,elapsed_seconds:null};
+  Object.assign(state,{archiveId:null,session,data,history,submissions,syncHealth,syncReadError:'',debug});
   state.screen='match';state.view='scoreboard';analysisCache=null;waitingSince=0;waitingStarting=false;$('setup').classList.add('hidden');$('qojWait').classList.add('hidden');$('home').classList.add('hidden');$('analysis').classList.add('hidden');$('match').classList.remove('hidden');$('matchNav').classList.remove('hidden');$('homeNav').classList.toggle('hidden',!state.canManage);$('analysisNav').classList.add('hidden');$('homeNav').classList.remove('active');$('analysisNav').classList.remove('active');$('scoreboardNav').classList.add('active');$('backBtn').classList.toggle('hidden',!state.canManage);
   renderFilterCategories();
   $('timeControls').classList.toggle('hidden',!state.debug.enabled||!state.canManage);
   $('timeSlider').max=String(state.data.duration);
   $('backBtn').textContent='比赛设置';$('topContest').textContent=session.name;$('contestTitle').textContent=session.name;
   $('modeLabel').textContent=matchModeLabel(session);
-  switchMatchView('scoreboard');renderTimeControls();tickClock();render();
+  switchMatchView('scoreboard');renderTimeControls();tickClock();requestRender();
 }
 
 async function enterHistory(ident){
@@ -1314,20 +1319,31 @@ async function refreshMatchSession(){
   matchSessionLoading=true;
   const requestedSession=state.session?.session_id;
   try{
-    const response=await readSession(),next=response.session;
-    if(state.screen!=='match'||state.archiveId||state.session?.session_id!==requestedSession)return;
+    const stillCurrent=()=>pageIsVisible()&&state.screen==='match'&&!state.archiveId&&state.session?.session_id===requestedSession;
+    const response=await readSession(state.canManage?null:requestedSession),next=response.session;
+    if(!stillCurrent())return;
     if(!next){state.session=null;if(state.canManage)await enterHostSetup();else enterViewerWaiting();return}
     const currentKey=state.session?.session_id||`${state.session?.path||''}:${state.session?.created_at_ms||''}`;
     const nextKey=next.session_id||`${next.path||''}:${next.created_at_ms||''}`;
     if(nextKey!==currentKey){
-      const previous={session:state.session,data:state.data,history:state.history,submissions:state.submissions,syncHealth:state.syncHealth,syncReadError:state.syncReadError,debug:state.debug};
-      try{await enterMatch()}
-      catch(error){Object.assign(state,previous);throw error}
+      await enterMatch(next);
       return;
     }
-    if(JSON.stringify(next)!==JSON.stringify(state.session)||response.permissionsChanged){state.session=next;requestRender();tickClock()}
+    let rowsChanged=false;
+    if(!state.canManage){
+      // An older service still supports the separate submissions endpoint.
+      const rows=response.submissions??await matchSubmissions(next.session_id,{pagePoll:true});
+      if(!stillCurrent())return;
+      rowsChanged=JSON.stringify(rows)!==JSON.stringify(state.submissions)||Boolean(state.syncReadError);
+      if(rowsChanged)state.submissions=rows;
+      state.syncReadError='';
+    }
+    if(rowsChanged||JSON.stringify(next)!==JSON.stringify(state.session)||response.permissionsChanged){state.session=next;requestRender();tickClock()}
   }catch(error){
-    if(!state.canManage&&state.screen==='match'&&!state.archiveId&&state.session?.session_id===requestedSession){state.syncReadError='与主机的连接暂时中断，正在自动重试…';requestRender()}
+    if(pageIsVisible()&&!state.canManage&&state.screen==='match'&&!state.archiveId&&state.session?.session_id===requestedSession){
+      const disconnected='与主机的连接暂时中断，正在自动重试…';
+      if(state.syncReadError!==disconnected){state.syncReadError=disconnected;requestRender()}
+    }
   }finally{matchSessionLoading=false}
 }
 
@@ -1474,7 +1490,7 @@ async function refreshViewerWaiting(){
   try{
     const session=await refreshSession();
     $('qojWaitError').textContent='';
-    if(session)await enterMatch();
+    if(session)await enterMatch(session);
   }catch(error){$('qojWaitError').textContent='暂时无法连接主机，正在自动重试…'}
 }
 async function refreshScheduledSession(){
@@ -1490,7 +1506,7 @@ async function refreshScheduledSession(){
     }
     const currentKey=state.session?.session_id||`${state.session?.path||''}:${state.session?.created_at_ms||''}`;
     const nextKey=next.session_id||`${next.path||''}:${next.created_at_ms||''}`;
-    if(nextKey!==currentKey){state.session=next;await enterMatch();return}
+    if(nextKey!==currentKey){await enterMatch(next);return}
     if(JSON.stringify(next)!==JSON.stringify(state.session)){state.session=next;enterScheduledWaiting(next);return}
     if(next.start_at_ms<=serverNow())await tickScheduledWaiting();
     $('qojWaitError').textContent='';
@@ -1946,7 +1962,7 @@ $('timeSlider').onchange=()=>setDebugTime(Number($('timeSlider').value)).catch(e
 for(const [id,delta] of [['timeBack',-600],['timeForward',600]])$(id).onclick=()=>setDebugTime(Math.max(0,Math.min(state.data.duration,effectiveElapsed()+delta))).catch(error=>$('timePreviewValue').textContent=error.message);
 $('timeLive').onclick=()=>setDebugTime(null).catch(error=>$('timePreviewValue').textContent=error.message);
 refreshSession().then(async()=>{
-  if(!state.canManage)return state.session?enterMatch():enterViewerWaiting();
+  if(!state.canManage)return state.session?enterMatch(state.session):enterViewerWaiting();
   await refreshContests();
   await refreshQojContestInfo();
   if(state.session&&state.session.start_at_ms>serverNow())return enterMatch();
@@ -1972,21 +1988,20 @@ const pageTasks={
   languages:visibleInterval(()=>{if(state.screen==='setup')renderVpObservation();autoReadQojLanguages()},1000),
   qoj:visibleInterval(refreshQojContestInfo,4000),
   debug:visibleInterval(refreshDebugTime,2000),
-  match:visibleInterval(refreshMatchSession,3000),
+  match:visibleInterval(refreshMatchSession,2000),
   controls:visibleInterval(renderTimeControls,1000,false),
   scheduledClock:visibleInterval(tickScheduledWaiting,1000,false),
   waiting:visibleInterval(refreshViewerWaiting,2000),
   scheduled:visibleInterval(refreshScheduledSession,2000),
   passive:visibleInterval(refreshPassiveSession,3000),
+  lan:visibleInterval(()=>{if(state.screen==='setup')return refreshLanInfo()},20000),
   board:visibleInterval(()=>{if(performance.now()-lastBoardRenderAt>=boardRefreshInterval())requestRender()},1000,false),
   submissions:visibleInterval(refreshSubmissionPoll,1000),
 };
 refreshQojContestInfo();renderStartMethod();renderScenarioExplanation();
 scheduleClockTick();
-let lastViewerSubmissionPoll=0;
 async function refreshSubmissionPoll(){
-  if(state.screen!=='match'||state.archiveId)return;
-  const now=performance.now();if(!state.canManage&&now-lastViewerSubmissionPoll<2000)return;lastViewerSubmissionPoll=now;
+  if(!state.canManage||state.screen!=='match'||state.archiveId)return;
   const sessionId=state.session?.session_id;
   try{
     const [rows,healthResponse]=await Promise.all([matchSubmissions(sessionId),state.canManage?api('/api/submission-sync-status'):Promise.resolve({sync:null})]);
@@ -2009,7 +2024,6 @@ function renderSyncStatus(){
 
 function resumePageState(){
   if(!pageIsVisible())return;
-  if(!clockTickTimer)scheduleClockTick();
   if(resumeTimer||resumeRefresh)return;
   // focus, pageshow and visibilitychange commonly arrive together.
   resumeTimer=setTimeout(()=>{
@@ -2022,8 +2036,11 @@ function resumePageState(){
       else if(state.screen==='viewer-wait')await pageTasks.waiting();
       else if(state.screen==='match')await pageTasks.match();
       else if(state.screen==='waiting'&&state.canManage){await pageTasks.vp();await pageTasks.passive()}
-      else if(state.screen==='setup')await pageTasks.passive();
-      if(state.screen==='match'){lastViewerSubmissionPoll=0;await pageTasks.submissions()}
+      else if(state.screen==='setup'){
+        void pageTasks.lan().catch(()=>{});
+        await pageTasks.passive();
+      }
+      if(state.screen==='match'&&state.canManage)await pageTasks.submissions();
     })().catch(()=>{}).finally(()=>{resumeRefresh=null;scheduleClockTick();requestRender()});
   },80);
 }
@@ -2035,8 +2052,10 @@ document.addEventListener('xcpc-qoj-sync-updated',()=>{
 });
 document.addEventListener('visibilitychange',()=>{
   if(pageIsVisible()){resumePageState();return}
+  for(const controller of pagePolls)controller.abort();
   if(resumeTimer){clearTimeout(resumeTimer);resumeTimer=0}
   if(renderFrame){cancelAnimationFrame(renderFrame);renderFrame=0}
+  if(virtualScrollFrame){cancelAnimationFrame(virtualScrollFrame);virtualScrollFrame=0}
   if(deferredRenderTimer){clearTimeout(deferredRenderTimer);deferredRenderTimer=0}
   if(clockTickTimer){clearTimeout(clockTickTimer);clockTickTimer=0}
 });
