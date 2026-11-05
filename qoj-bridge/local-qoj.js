@@ -57,10 +57,12 @@
     const observation=(await response.json()).observation;
     return observation?.qoj_contest_id===contestId&&['countdown','finish-confirmed'].includes(observation.source)?observation:null;
   };
-  let busy=false,lastUrl='',lastName='',lastPost=0,lastNotStartedPost=0,previous=null;
+  let busy=false,lastUrl='',lastName='',lastPost=0,lastNotStartedPost=0,previous=null,disconnected=false,pollTimer=null;
+  const stop=()=>{disconnected=true;clearInterval(pollTimer);show('扩展连接已失效，请刷新本页重新连接。',true)};
+  document.addEventListener('xcpc-submit-bridge-disconnected',stop);
   async function poll(){
     const setup=document.getElementById('setup'),waiting=document.getElementById('qojWait');
-    if(busy||setup?.classList.contains('hidden')&&(!waiting||waiting.classList.contains('hidden')))return;
+    if(disconnected||busy||setup?.classList.contains('hidden')&&(!waiting||waiting.classList.contains('hidden')))return;
     let url,contestId;
     try{
       url=new URL(input.value.trim());
@@ -72,6 +74,7 @@
     try{
       show('扩展正在使用当前 QOJ 登录会话读取比赛页面…');
       const requestStartedAt=preciseNow(),{html,sample_age_ms}=await extension('VP_FETCH_QOJ_PAGE',{url:url.href}),responseReceivedAt=preciseNow();
+      if(disconnected)return;
       const root=new DOMParser().parseFromString(html,'text/html');
       if(root.querySelector('form[action*="login"],input[type="password"]')||/^Login(?:\s+-|$)/i.test(norm(root.title)))throw Error('QOJ 登录状态已失效，请先登录 QOJ');
       const name=contestName(root);
@@ -84,19 +87,23 @@
       }
       previous=value===null?null:{value,at:now};
       const area=virtualArea(root),text=label(area);
-      if(value!==null){show(`已读取 ${name}；VP 倒计时 ${String(Math.floor(value/3600)).padStart(2,'0')}:${String(Math.floor(value/60)%60).padStart(2,'0')}:${String(value%60).padStart(2,'0')}`);chrome.storage.local.set({vpStartStatus:'已由扩展直接读取 QOJ 倒计时。'})}
+      if(value!==null){show(`已读取 ${name}；VP 倒计时 ${String(Math.floor(value/3600)).padStart(2,'0')}:${String(Math.floor(value/60)%60).padStart(2,'0')}:${String(value%60).padStart(2,'0')}`);await chrome.storage.local.set({vpStartStatus:'已由扩展直接读取 QOJ 倒计时。'})}
       else if(/(?:^|\s)start!?\s*$/i.test(text)||/你可以开始虚拟参赛|you can start your participation/i.test(text)){
         if(now-lastNotStartedPost>=4000){await post('/api/qoj-vp-observation',{qoj_contest_id:contestId,source:'not-started'});lastNotStartedPost=now}
-        show(`已读取 ${name}；这场 VP 尚未开始。`);chrome.storage.local.set({vpStartStatus:'已连接 QOJ；这场 VP 尚未开始。'});
+        show(`已读取 ${name}；这场 VP 尚未开始。`);await chrome.storage.local.set({vpStartStatus:'已连接 QOJ；这场 VP 尚未开始。'});
       }
       else{
         const observation=await observedStart(contestId);
         if(observation)show(`已读取 ${name}；QOJ 比赛页已经识别到进行中的 VP，倒计时见下方。`);
         else show(`已读取 ${name}；等待 QOJ 比赛页出现 VP 启动或倒计时。`);
       }
-    }catch(error){show('QOJ 读取失败：'+error.message,true);chrome.storage.local.set({vpStartStatus:'读取 QOJ 比赛状态失败：'+error.message});previous=null}
+    }catch(error){
+      if(disconnected||/extension context invalidated/i.test(String(error.message))){stop();return}
+      show('QOJ 读取失败：'+error.message,true);previous=null;
+      try{await chrome.storage.local.set({vpStartStatus:'读取 QOJ 比赛状态失败：'+error.message})}catch{stop()}
+    }
     finally{busy=false}
   }
   input.addEventListener('input',()=>{lastUrl='';poll()});
-  poll();setInterval(poll,2000);
+  poll();pollTimer=setInterval(poll,2000);
 })();

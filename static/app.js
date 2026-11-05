@@ -7,6 +7,7 @@ let analysisCache=null,analysisCohortSolved=null,analysisChartRange=null,analysi
 let liveStandingsCache=null;
 let lastStandingsView=null;
 let renderFrame=0,resumeTimer=0,resumeRefresh=null,clockTickTimer=0;
+let responsiveRender=null;
 const pendingReads=new Map();
 const pagePolls=new Set();
 const pageIsVisible=()=>typeof document==='undefined'||!document.hidden;
@@ -31,7 +32,7 @@ const api=(url,{pagePoll=false,...options}={})=>{
     const timeout=/^\/api\/(session|submissions|submission-sync-status|debug-time|qoj-vp-observation|qoj-contest-info)(?:\?|$)/.test(url)?8000:45000;
     const timer=controller?setTimeout(()=>controller.abort(),timeout):null;
     try{
-      const response=await fetch(url,{cache:'no-store',...options,...(controller?{signal:controller.signal}:{})});
+      const response=await fetch(url,{cache:/^\/api\/contest\?/.test(url)?'no-cache':'no-store',...options,...(controller?{signal:controller.signal}:{})});
       const body=await response.json();if(!response.ok){const error=Error(body.error||response.statusText);error.status=response.status;throw error}return body;
     }catch(error){if(controller?.signal.aborted)throw Error('与主机连接超时，正在重试');throw error}
     finally{if(timer!==null)clearTimeout(timer);if(pagePoll)pagePolls.delete(controller)}
@@ -206,6 +207,7 @@ function adjustedRuns(data){
 
 const submissionContestTime=(submission,session)=>{const direct=Number(submission.contest_time_seconds);return Number.isFinite(direct)?direct:(Number(submission.submitted_at_ms)-session.start_at_ms)/1000};
 const isLocalSendAttempt=row=>Boolean(row.from_submit&&!row.qoj_id);
+const isSendingRequest=row=>isLocalSendAttempt(row)&&['queued','sending'].includes(row.status);
 function ownRuns(data,submissions,session){
   const labels=new Map(data.problems.map(p=>[p.label.toUpperCase(),p.id]));
   return submissions.map(r=>{
@@ -234,7 +236,7 @@ function* mergeRuns(history,own){
   while(i<history.length)yield history[i++];
   while(j<own.length)yield own[j++];
 }
-function compute(data,history,submissions,session,elapsed,revealFrozen=false,historySorted=false){
+function* replayScores(data,history,submissions,session,elapsed,revealFrozen=false,historySorted=false){
   const mode=session.mode,freeze=Math.max(0,data.duration-(mode==='ccpc'?3600:Number(data.config.frozen_time??3600)));
   const observationTime=Math.max(0,elapsed),time=Math.min(data.duration,observationTime);
   const frozen=freeze<data.duration&&time>=freeze&&!session.revealed_at_ms&&!revealFrozen;
@@ -245,7 +247,9 @@ function compute(data,history,submissions,session,elapsed,revealFrozen=false,his
   const allRuns=historySorted?(teamRuns.length?mergeRuns(history,sortRuns(teamRuns)):history):sortRuns([...history,...teamRuns]);
   // Historical VP verdicts may have been observed after the contest ended.
   const finalPublished=Boolean(session.revealed_at_ms)&&observationTime>=data.duration;
+  let processed=0;
   for(const run of allRuns){
+    if((processed++&255)===0)yield;
     if(run.time>=data.duration||run.time>time)break;
     const row=rows.get(run.team);if(!row||!accepted.has(run.problem))continue;
     const cell=row.states.get(run.problem)||{attempts:0,pending:0,accepted:null,first:run.time};
@@ -276,19 +280,48 @@ function compute(data,history,submissions,session,elapsed,revealFrozen=false,his
   return{ordered,visible,freeze,threshold,firstSolve,time,frozen};
 }
 
-function liveStandings(data,history,submissions,session,elapsed){
+function compute(...args){
+  const replay=replayScores(...args);let step;
+  do{step=replay.next()}while(!step.done);
+  return step.value;
+}
+const yieldPageTask=()=>globalThis.scheduler?.yield?.()??new Promise(resolve=>setTimeout(resolve,0));
+async function computeCooperatively(data,history,submissions,session,elapsed,stillNeeded){
+  const replay=replayScores(data,history,submissions,session,elapsed,false,true);
+  let step,sliceStart=steadyNow();
+  do{
+    if(!stillNeeded())return null;
+    step=replay.next();
+    if(!step.done&&steadyNow()-sliceStart>=8){await yieldPageTask();sliceStart=steadyNow()}
+  }while(!step.done);
+  return step.value;
+}
+function standingsKey(data,history,submissions,session,elapsed){
   const time=Math.min(data.duration,Math.max(0,elapsed));
   let low=0,high=history.length;
   while(low<high){const middle=(low+high)>>>1;if(history[middle].time<=time)low=middle+1;else high=middle}
   const freeze=Math.max(0,data.duration-(session.mode==='ccpc'?3600:Number(data.config.frozen_time??3600)));
   const ownKey=ownRuns(data,submissions,session).map(run=>`${run.id}:${run.problem}:${run.time}:${run.status}:${run.time<=time?1:0}:${run.resultTime<=elapsed?1:0}`).join('|');
-  const key=`${session.session_id}:${session.mode}:${session.own_name}:${session.start_at_ms}:${Boolean(session.revealed_at_ms)}:${time>=freeze}:${time>=data.duration}:${low}:${ownKey}`;
+  return`${session.session_id}:${session.mode}:${session.own_name}:${session.start_at_ms}:${Boolean(session.revealed_at_ms)}:${time>=freeze}:${time>=data.duration}:${low}:${ownKey}`;
+}
+function liveStandings(data,history,submissions,session,elapsed){
+  const time=Math.min(data.duration,Math.max(0,elapsed)),key=standingsKey(data,history,submissions,session,elapsed);
   if(!liveStandingsCache||liveStandingsCache.data!==data||liveStandingsCache.history!==history||liveStandingsCache.key!==key){
     const result=compute(data,history,submissions,session,elapsed,false,true);
     const ownLive=result.frozen?compute({...data,teams:[]},[],submissions,session,elapsed,true,true).ordered[0]:null;
     liveStandingsCache={data,history,key,result,ownLive};
   }
   // Phase labels still follow time between submission events and at the deadline.
+  return{result:{...liveStandingsCache.result,time},ownLive:liveStandingsCache.ownLive,revision:liveStandingsCache};
+}
+async function responsiveStandings(data,history,submissions,session,elapsed,stillNeeded){
+  const key=standingsKey(data,history,submissions,session,elapsed),time=Math.min(data.duration,Math.max(0,elapsed));
+  if(!liveStandingsCache||liveStandingsCache.data!==data||liveStandingsCache.history!==history||liveStandingsCache.key!==key){
+    const result=await computeCooperatively(data,history,submissions,session,elapsed,stillNeeded);
+    if(!result||!stillNeeded())return null;
+    const ownLive=result.frozen?compute({...data,teams:[]},[],submissions,session,elapsed,true,true).ordered[0]:null;
+    liveStandingsCache={data,history,key,result,ownLive};
+  }
   return{result:{...liveStandingsCache.result,time},ownLive:liveStandingsCache.ownLive,revision:liveStandingsCache};
 }
 
@@ -684,7 +717,7 @@ function renderHome(data,session,result,rankLabel,ownRow){
 
 function renderHomeSubmissions(data,session,time=Math.min(data.duration,Math.max(0,effectiveElapsed()))){
   const labels=new Map(data.problems.map(problem=>[problem.label.toUpperCase(),problem]));
-  const rows=state.submissions.filter(row=>row.status!=='send_cancelled').map(submission=>({...submission,contestTime:submissionContestTime(submission,session)})).filter(submission=>isLocalSendAttempt(submission)||Number.isFinite(submission.contestTime)&&submission.contestTime>=0&&(submission.from_submit||submission.contestTime<data.duration&&submission.contestTime<=time)).sort((a,b)=>b.contestTime-a.contestTime||String(b.id).localeCompare(String(a.id)));
+  const rows=state.submissions.filter(row=>row.status!=='send_cancelled'&&!isSendingRequest(row)).map(submission=>({...submission,contestTime:submissionContestTime(submission,session)})).filter(submission=>isLocalSendAttempt(submission)||Number.isFinite(submission.contestTime)&&submission.contestTime>=0&&(submission.from_submit||submission.contestTime<data.duration&&submission.contestTime<=time)).sort((a,b)=>b.contestTime-a.contestTime||String(b.id).localeCompare(String(a.id)));
   patchHtml($('homeSubmissions'),rows.map(submission=>{
     const problem=labels.get(String(submission.problem).toUpperCase()),status=statusType(submission.status),rawStatus=String(submission.status||'').toLowerCase();
     const remoteId=submission.qoj_id||(/^\d+$/.test(submission.id)?submission.id:null),submissionUrl=remoteId?new URL('/submission/'+remoteId,session.qoj_url).href:'';
@@ -757,13 +790,14 @@ function medalNoticeTitle(data){
 }
 
 function qojSyncText(){
-  const pending=state.submissions.filter(row=>row.status==='pending').length;
-  if(state.archiveId)return`QOJ 历史记录 · ${state.submissions.length} submissions`;
+  const received=state.submissions.filter(row=>!isLocalSendAttempt(row));
+  const pending=received.filter(row=>row.status==='pending').length;
+  if(state.archiveId)return`QOJ 历史记录 · ${received.length} submissions`;
   if(state.syncReadError)return'本地服务连接中断，正在重试 · 已保留现有成绩';
   if(state.syncHealth?.error)return`QOJ 同步失败：${state.syncHealth.error} · 已保留现有成绩`;
   const observed=Number(state.syncHealth?.observed_at_ms),age=Number.isFinite(observed)?Math.max(0,Math.floor((serverNow()-observed)/1000)):Infinity;
   const submitBridge=state.canManage?(document.documentElement.dataset.xcpcSubmitBridge==='1'?' · 网页提交已连接':' · 网页提交未连接'):'';
-  const detail=`${state.submissions.length} submissions${pending?' · '+pending+' pending':''}${submitBridge}`;
+  const detail=`${received.length} submissions${pending?' · '+pending+' pending':''}${submitBridge}`;
   if(!Number.isFinite(observed))return`未收到扩展同步 · ${detail} · 请在装有扩展且已登录 QOJ 的浏览器中刷新本页`;
   return age<=8?`QOJ 已连接 · ${detail}`:age<=30?`QOJ 同步延迟 ${age}s · ${detail} · 已保留现有成绩`:`QOJ 同步中断 · ${detail} · 已保留现有成绩`;
 }
@@ -772,8 +806,9 @@ function boardRefreshInterval(teamCount=state.data?.teams?.length||0){
   return teamCount>=1200?10_000:teamCount>=600?7_000:5_000;
 }
 
-const virtualTeamThreshold=400;
-function largeScoreboard(){return(state.data?.teams?.length||0)>=virtualTeamThreshold}
+const virtualTeamThreshold=80;
+const scoreboardVirtualLimit=data=>Math.max(24,Math.min(virtualTeamThreshold,Math.floor(1000/((data?.problems?.length||0)+4))));
+function largeScoreboard(){return(state.data?.teams?.length||0)>=scoreboardVirtualLimit(state.data)}
 
 function patchHtml(element,html){
   if(element.__xcpcHtml===html)return;
@@ -822,13 +857,13 @@ function patchScoreboardRows(rows,data,result,session,virtualOnly=false){
     patchHtml(tbody,`<tr><td class="empty" colspan="${data.problems.length+4}">没有匹配的队伍</td></tr>`);
     return;
   }
-  const virtual=rows.length>=virtualTeamThreshold;
+  const virtual=rows.length>=scoreboardVirtualLimit(data);
   if(virtual&&!virtualOnly)virtualBoardState={rows,data,result,session,tableTop:tbody.getBoundingClientRect().top+window.scrollY,rangeKey:''};
   if(!virtual)virtualBoardState=null;
   tbody.dataset.totalRows=String(rows.length);
   let shownRows=rows,topHeight=0,bottomHeight=0;
   if(virtual&&typeof window!=='undefined'){
-    const rowHeight=56,overscan=20,batchSize=40,tbodyTop=virtualBoardState?.tableTop??(tbody.getBoundingClientRect().top+window.scrollY);
+    const rowHeight=56,overscan=6,batchSize=12,tbodyTop=virtualBoardState?.tableTop??(tbody.getBoundingClientRect().top+window.scrollY);
     const relativeTop=Math.max(0,window.scrollY-tbodyTop);
     const firstVisible=Math.floor(relativeTop/rowHeight),visibleCount=Math.ceil(window.innerHeight/rowHeight);
     const start=Math.min(Math.floor(Math.max(0,firstVisible-overscan)/batchSize)*batchSize,Math.max(0,rows.length-visibleCount-overscan));
@@ -851,10 +886,10 @@ function patchScoreboardRows(rows,data,result,session,virtualOnly=false){
     else tbody.insertBefore(node,cursor);
   }
   for(const node of [...tbody.children])if(!keep.has(node))node.remove();
-  if(data.teams.length>=virtualTeamThreshold&&scoreboardRows.size>240){
+  if(data.teams.length>=scoreboardVirtualLimit(data)&&scoreboardRows.size>96){
     const visibleIds=new Set(shownRows.map(row=>row.id));
     for(const id of scoreboardRows.keys()){
-      if(scoreboardRows.size<=240)break;
+      if(scoreboardRows.size<=96)break;
       if(!visibleIds.has(id))scoreboardRows.delete(id);
     }
   }
@@ -878,6 +913,17 @@ function renderMatchMetadata(data,session){
 }
 
 function render(){
+  if(responsiveRender){responsiveRender.again=true;return responsiveRender.promise}
+  const job={again:false,promise:null};responsiveRender=job;
+  job.promise=renderCurrent().catch(error=>{
+    if(state.screen==='match')$('contestPhase').textContent='榜单暂未更新：'+error.message;
+  }).finally(()=>{
+    if(responsiveRender===job)responsiveRender=null;
+    if(job.again)requestRender();
+  });
+  return job.promise;
+}
+async function renderCurrent(){
   if(!pageIsVisible())return;
   $('submitBtn')?.classList.toggle('hidden',!maySubmit());
   updateSubmitAvailability();
@@ -901,7 +947,11 @@ function render(){
     lastBoardRenderAt=performance.now();
     return;
   }
-  const {result,ownLive,revision}=liveStandings(data,state.history,state.submissions,session,elapsed);
+  const history=state.history,submissions=state.submissions,view=state.view;
+  const stillNeeded=()=>pageIsVisible()&&state.screen==='match'&&state.data===data&&state.history===history&&state.session===session&&state.submissions===submissions&&state.view===view;
+  const snapshot=largeScoreboard()?await responsiveStandings(data,history,submissions,session,elapsed,stillNeeded):liveStandings(data,history,submissions,session,elapsed);
+  if(!snapshot||!stillNeeded())return;
+  const {result,ownLive,revision}=snapshot;
   const ownRow=ownLive||result.ordered.find(row=>row.id===ownId);
   if(state.view==='home'){
     renderHome(data,session,result,ownRow?`*(${projectedOfficialRank(result.ordered,ownRow)})`:'*',ownRow);
@@ -1564,7 +1614,7 @@ $('archiveBtn').onclick=async()=>{
 function submissionVerdict(row){
   return{correct:'CORRECT',incorrect:'WRONG ANSWER',wrong_answer:'WRONG ANSWER',memory_limit:'MEMORY LIMIT',time_limit:'TIME LIMIT',runtime_error:'RUNTIME ERROR',output_limit:'OUTPUT LIMIT',presentation_error:'PRESENTATION ERROR',pending:'PENDING',compile_error:'COMPILE ERROR',too_late:'TOO LATE',awaiting_sync:'PENDING'}[row.status]||String(row.status||'PENDING').toUpperCase();
 }
-const submitUi={form:null,generation:0,busy:false,attempted:false,detailGeneration:0,details:null,detailSession:null,source:'',filename:'',preferredLanguage:''};
+const submitUi={form:null,generation:0,loading:false,busy:false,attempted:false,detailGeneration:0,details:null,detailSession:null,source:'',filename:'',preferredLanguage:''};
 const rejudgeUi={active:new Set(),errors:new Map(),fileRequest:null};
 const rejudgeKey=(session,ident)=>`${session.session_id}:${ident}`;
 function submitClosedReason(){
@@ -1578,7 +1628,12 @@ function submitClosedReason(){
 }
 function updateSubmitAvailability(){
   const reason=submitClosedReason(),button=$('submitBtn');
-  if(button){button.disabled=Boolean(reason)||submitUi.busy;button.title=reason||(submitUi.busy?'正在处理本次提交':'')}
+  const sending=state.archiveId?0:state.submissions.filter(isSendingRequest).length;
+  if(button){
+    button.disabled=Boolean(reason)||submitUi.busy;button.title=reason||(submitUi.busy?'正在处理本次提交':'');
+    button.setAttribute('aria-busy',String(submitUi.busy||sending>0));
+    $('submitButtonLabel').textContent=submitUi.busy?'Submitting…':sending?`Submit · ${sending} in progress`:'Submit';
+  }
   if($('submitDialog')?.open&&!submitUi.busy&&!submitUi.attempted&&reason){
     $('submitConfirm').disabled=true;$('submitStatus').textContent=reason;
   }
@@ -1642,12 +1697,30 @@ function clearSubmissionSourceView(){
 function submitExtension(type,payload,timeout=35000){
   if(document.documentElement.dataset.xcpcSubmitBridge!=='1')return Promise.reject(Error('请重新加载 QOJ 扩展并刷新本页，启用 Submit'));
   return new Promise((resolve,reject)=>{
-    const requestId=requestUuid(),timer=setTimeout(()=>{window.removeEventListener('message',listener);reject(Error('扩展响应超时，请检查 QOJ；已发送的代码请勿重复提交'))},timeout);
+    const cleanup=()=>{
+      clearTimeout(timer);window.removeEventListener('message',listener);
+      document.removeEventListener('xcpc-submit-bridge-disconnected',disconnected);
+    };
+    const disconnected=()=>{
+      cleanup();
+      reject(Error(type==='VP_SEND_SOLUTION'?'扩展连接已中断，请刷新本页，并核对 QOJ 和提交记录后再重试。':
+        type==='VP_OPEN_SUBMIT_FORM'?'扩展连接已失效，请刷新本页重新连接。代码未发送。':'扩展连接已失效，请刷新本页重新连接。'));
+    };
+    const requestId=requestUuid(),timer=setTimeout(()=>{
+      if(type==='VP_SUBMIT_BRIDGE_PING'){
+        delete document.documentElement.dataset.xcpcSubmitBridge;
+        document.dispatchEvent(new Event('xcpc-submit-bridge-disconnected'));return;
+      }
+      cleanup();
+      reject(Error(type==='VP_SEND_SOLUTION'?'扩展响应超时，请检查 QOJ；已发送的代码请勿重复提交':
+        type==='VP_OPEN_SUBMIT_FORM'?'QOJ 提交表单读取超时，代码未发送。请点 Retry 重试。':'扩展读取超时，请检查主机浏览器和 QOJ 后重试。'));
+    },timeout);
     const listener=event=>{
       if(event.source!==window||event.origin!==location.origin||event.data?.source!=='xcpc-submit-extension'||event.data.requestId!==requestId)return;
-      clearTimeout(timer);window.removeEventListener('message',listener);
+      cleanup();
       event.data.ok?resolve(event.data.body):reject(Error(event.data.error||'扩展连接失败'));
     };
+    document.addEventListener('xcpc-submit-bridge-disconnected',disconnected);
     window.addEventListener('message',listener);window.postMessage({source:'xcpc-submit-page',requestId,type,payload},location.origin);
   });
 }
@@ -1669,13 +1742,17 @@ async function remoteSubmitRequest(action,payload,stillNeeded=()=>true,onQueued=
     job={status:'unknown'};
   }
   onQueued(job);
-  const deadline=performance.now()+150000;
+  const deadline=performance.now()+(action==='inspect'?25000:150000);
   while(!['done','failed','uncertain'].includes(job.status)){
     if(!stillNeeded()){
       await relayPost('cancel',{id:request_id,token}).catch(()=>{});
       throw Error('请求已取消');
     }
-    if(performance.now()>deadline)throw Error(['send','rejudge'].includes(action)?'未能确认主机回执，请先查看 QOJ，勿重复发送':'等待主机扩展超时，请检查主机浏览器和扩展');
+    if(performance.now()>deadline){
+      if(action==='inspect')await relayPost('cancel',{id:request_id,token}).catch(()=>{});
+      throw Error(['send','rejudge'].includes(action)?'未能确认主机回执，请先查看 QOJ，勿重复发送':
+        action==='inspect'?'等待主机读取 QOJ 表单超时，代码未发送。请点 Retry 重试。':'等待主机扩展超时，请检查主机浏览器和扩展');
+    }
     if(action==='send')$('submitStatus').textContent=job.status==='sending'?'主机正在提交到 QOJ…':'等待主机扩展转发…';
     await new Promise(resolve=>setTimeout(resolve,700));
     try{job=await relayPost('status',{id:request_id,token})}catch(error){if(error.status&&error.status<500)throw error}
@@ -1709,21 +1786,19 @@ async function rejudgeSubmission(session,ident,file){
 }
 async function loadSubmitProblem(){
   const generation=++submitUi.generation,session=state.session,label=$('submitProblem').value;
+  submitUi.loading=false;$('retrySubmitForm').classList.add('hidden');$('submitAccount').textContent='';
   const previous=submitUi.form;submitUi.form=null;closeSubmitForm(previous);
   $('submitConfirm').disabled=true;populateSubmitLanguages({languages:[],selected:''},submitUi.preferredLanguage);
   if(submitClosedReason()){$('submitStatus').textContent=submitClosedReason();return}
   if(!label){$('submitStatus').textContent='请选择源码文件或题目';return}
+  submitUi.loading=true;
   $('submitStatus').textContent=state.canManage?'正在读取 QOJ 提交表单…':'等待主机扩展读取 QOJ 提交表单…';
   try{
     let form;
     if(!state.canManage)form=await remoteSubmitRequest('inspect',{session_id:session.session_id,problem:label},()=>generation===submitUi.generation&&$('submitDialog').open&&state.session?.session_id===session.session_id);
     else{
-      const {html}=await submitExtension('VP_FETCH_QOJ_PAGE',{url:session.qoj_url});
-      const doc=new DOMParser().parseFromString(html,'text/html');
-      const row=[...doc.querySelectorAll('tr')].find(tr=>tr.querySelector('td')?.textContent.trim().toUpperCase()===label.toUpperCase());
-      const problemId=row?.querySelector('a[href*="/problem/"]')?.getAttribute('href')?.match(/\/problem\/(\d+)/)?.[1];
-      if(!problemId)throw Error('未找到该题的 QOJ 对应题号，请检查比赛地址和登录状态');
-      form=await submitExtension('VP_OPEN_SUBMIT_FORM',{session_id:session.session_id,problem_id:problemId});
+      await submitExtension('VP_SUBMIT_BRIDGE_PING',{},2000);
+      form=await submitExtension('VP_OPEN_SUBMIT_FORM',{session_id:session.session_id,problem:label},25000);
     }
     if(generation!==submitUi.generation||!$('submitDialog').open||state.session?.session_id!==session.session_id){closeSubmitForm(form);return}
     submitUi.form=form;
@@ -1733,7 +1808,13 @@ async function loadSubmitProblem(){
     else if(!$('submitLanguage').value)$('submitStatus').textContent='请选择语言';
     else $('submitStatus').textContent='';
     $('submitConfirm').disabled=!submitUi.source||!$('submitLanguage').value||Boolean(submitClosedReason());
-  }catch(error){if(generation===submitUi.generation)$('submitStatus').textContent=error.message}
+  }catch(error){if(generation===submitUi.generation){
+    $('submitStatus').textContent=error.message==='QOJ 题目 ID 无效'?
+      '请在扩展管理页重新加载 QOJ 扩展，再刷新本页。代码未发送。':error.message;
+    $('retrySubmitForm').textContent=state.canManage&&document.documentElement.dataset.xcpcSubmitBridge!=='1'?'Reload page':'Retry';
+    $('retrySubmitForm').classList.remove('hidden');
+  }}
+  finally{if(generation===submitUi.generation)submitUi.loading=false}
 }
 async function sendSolution(event){
   event.preventDefault();if(submitUi.busy||!submitUi.form||!maySubmit())return;
@@ -1860,7 +1941,7 @@ async function refreshSubmissionSource(){
 }
 function initializeSubmissionUI(){
   const holder=document.createElement('div');
-  holder.innerHTML=`<dialog id="submitDialog" class="submission-dialog"><header><h2>Submit</h2><button type="button" data-close-dialog="submitDialog" aria-label="关闭">×</button></header><form id="solutionForm"><label>Source files<input id="submitFile" type="file" accept=".c,.cc,.cpp,.cxx,.c++,.java,.py" required></label><label>Problem<select id="submitProblem" required></select></label><label>Language<select id="submitLanguage" required></select></label><p id="submitAccount" class="submit-account"></p><p id="submitStatus" class="submit-status" role="status" aria-live="polite"></p><footer><button type="button" class="secondary" data-close-dialog="submitDialog">Cancel</button><button id="submitConfirm" class="submit-primary" type="submit" disabled>Submit</button></footer></form></dialog>
+  holder.innerHTML=`<dialog id="submitDialog" class="submission-dialog"><header><h2>Submit</h2><button type="button" data-close-dialog="submitDialog" aria-label="关闭">×</button></header><form id="solutionForm"><label>Source files<input id="submitFile" type="file" accept=".c,.cc,.cpp,.cxx,.c++,.java,.py" required></label><label>Problem<select id="submitProblem" required></select></label><label>Language<select id="submitLanguage" required></select></label><p id="submitAccount" class="submit-account"></p><p id="submitStatus" class="submit-status" role="status" aria-live="polite"></p><button id="retrySubmitForm" class="secondary compact hidden" type="button">Retry</button><footer><button type="button" class="secondary" data-close-dialog="submitDialog">Cancel</button><button id="submitConfirm" class="submit-primary" type="submit" disabled>Submit</button></footer></form></dialog>
   <dialog id="submissionSourceDialog" class="submission-dialog detail-dialog source-dialog"><header><h2 id="submissionSourceTitle">Source code</h2><button type="button" data-close-dialog="submissionSourceDialog" aria-label="Close">×</button></header><div class="submission-source-body"><div class="submission-source-toolbar"><span id="submissionSourceFilename"></span><a id="submissionQojLink" target="_blank" rel="noopener">QOJ ↗</a><button id="refreshSubmissionSource" class="secondary compact" type="button">Reload</button><button id="downloadSubmissionSource" class="secondary compact" type="button">Download</button></div><pre id="submissionSource" class="submission-code hidden" tabindex="0" aria-label="Source code"></pre><p id="submissionSourceStatus" class="submit-status" role="status" aria-live="polite"></p></div></dialog>`;
   document.body.append(holder);
   const rejudgeFile=document.createElement('input');rejudgeFile.type='file';rejudgeFile.accept='.c,.cc,.cpp,.cxx,.c++,.java,.py,.txt';rejudgeFile.hidden=true;
@@ -1871,9 +1952,13 @@ function initializeSubmissionUI(){
   };
   holder.querySelectorAll('[data-close-dialog]').forEach(button=>button.onclick=()=>{if(button.dataset.closeDialog==='submitDialog'&&submitUi.busy)return;$(button.dataset.closeDialog).close()});
   $('submitDialog').addEventListener('cancel',event=>{if(submitUi.busy)event.preventDefault()});
-  $('submitDialog').addEventListener('close',()=>{submitUi.generation++;if(!submitUi.busy)closeSubmitForm()});
+  $('submitDialog').addEventListener('close',()=>{submitUi.generation++;submitUi.loading=false;if(!submitUi.busy)closeSubmitForm()});
   $('submissionSourceDialog').addEventListener('close',()=>{if(!$('submissionSourceDialog').open)clearSubmissionSourceView()});
   $('submitProblem').onchange=loadSubmitProblem;$('submitLanguage').onchange=()=>{$('submitConfirm').disabled=!submitUi.form||!submitUi.source||!$('submitLanguage').value||Boolean(submitClosedReason())};$('solutionForm').onsubmit=sendSolution;
+  $('retrySubmitForm').onclick=()=>{
+    if(state.canManage&&document.documentElement.dataset.xcpcSubmitBridge!=='1'){location.reload();return}
+    void loadSubmitProblem();
+  };
   $('submitFile').onchange=async()=>{
     const file=$('submitFile').files[0];submitUi.source='';submitUi.filename='';$('submitConfirm').disabled=true;
     if(!file)return;
@@ -1884,10 +1969,12 @@ function initializeSubmissionUI(){
     if(detected.problem&&$('submitProblem').value!==detected.problem){$('submitProblem').value=detected.problem;await loadSubmitProblem()}
     else if(!$('submitProblem').value)$('submitStatus').textContent='未从文件名识别出题目，请手动选择';
     else if(submitUi.form){populateSubmitLanguages(submitUi.form,detected.language);$('submitConfirm').disabled=!$('submitLanguage').value||Boolean(submitClosedReason())}
+    else if(!submitUi.loading)await loadSubmitProblem();
   };
   $('submitBtn').onclick=()=>{
     if(submitUi.busy||!maySubmit()||submitClosedReason())return;
     submitUi.attempted=false;
+    submitUi.loading=false;$('retrySubmitForm').classList.add('hidden');
     submitUi.source='';submitUi.filename='';submitUi.preferredLanguage='';$('submitFile').value='';
     $('submitDialog').dataset.sessionId=state.session.session_id;$('submitAccount').textContent='';
     $('submitProblem').replaceChildren(new Option('Select a problem',''),...state.data.problems.map(problem=>new Option(problem.label,problem.label)));
@@ -2049,6 +2136,19 @@ window.addEventListener('online',resumePageState);
 window.addEventListener('pageshow',resumePageState);
 document.addEventListener('xcpc-qoj-sync-updated',()=>{
   if(pageIsVisible()&&state.canManage&&state.screen==='match')void pageTasks.submissions().catch(()=>{});
+});
+document.addEventListener('xcpc-submit-bridge-connected',()=>{
+  renderQojLanguageSettings();renderSyncStatus();
+});
+document.addEventListener('xcpc-submit-bridge-disconnected',()=>{
+  delete document.documentElement.dataset.xcpcSubmitBridge;
+  renderQojLanguageSettings();renderSyncStatus();
+  if($('submitDialog').open&&!submitUi.busy){
+    submitUi.generation++;submitUi.loading=false;submitUi.form=null;
+    $('submitConfirm').disabled=true;$('submitAccount').textContent='';
+    $('submitStatus').textContent='扩展连接已失效，请刷新本页重新连接。代码未发送。';
+    $('retrySubmitForm').textContent='Reload page';$('retrySubmitForm').classList.remove('hidden');
+  }
 });
 document.addEventListener('visibilitychange',()=>{
   if(pageIsVisible()){resumePageState();return}

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "XCPC VP QOJ 同步",
-  "version": "0.5.21",
+  "version": "0.5.23",
   "description": "沿用浏览器 QOJ 登录会话同步本队提交，并按用户操作向 QOJ 提交源码。",
   "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": ["https://qoj.ac/*", "https://*.qoj.ac/*", "https://pjudge.ac/*", "http://*/*"],

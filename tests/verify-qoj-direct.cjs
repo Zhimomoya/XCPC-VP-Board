@@ -25,7 +25,7 @@ async function backgroundFetchTest(){
 }
 
 async function localSetupTest(){
-  let inputListener,interval,hidden=false,waiting=false,qojReads=0;
+  let inputListener,interval,disconnect,intervalCleared=false,hidden=false,waiting=false,qojReads=0;
   let steady=100000,wallShift=0;
   const posts=[];
   const input={value:'https://qoj.ac/contest/1828',addEventListener:(_,callback)=>inputListener=callback};
@@ -41,13 +41,14 @@ async function localSetupTest(){
   };
   const context={
     URL,Date:{now:()=>steady+wallShift},performance:{now:()=>steady},location:{hostname:'127.0.0.1'},DOMParser:class{parseFromString(){return root}},
-    document:{documentElement:{dataset:{}},getElementById:id=>id==='qojUrl'?input:id==='qojContestName'?nameBox:id==='setup'?{classList:{contains:()=>hidden}}:id==='qojWait'?{classList:{contains:()=>!waiting}}:null,createElement:()=>statusBox},
+    document:{documentElement:{dataset:{}},addEventListener:(name,callback)=>{if(name==='xcpc-submit-bridge-disconnected')disconnect=callback},getElementById:id=>id==='qojUrl'?input:id==='qojContestName'?nameBox:id==='setup'?{classList:{contains:()=>hidden}}:id==='qojWait'?{classList:{contains:()=>!waiting}}:null,createElement:()=>statusBox},
     chrome:{
       runtime:{sendMessage:(_,callback)=>{qojReads++;callback({ok:true,body:{html:'<html></html>',sampled_at_ms:steady-3600000,sample_age_ms:2000}})},lastError:null},
       storage:{local:{set:()=>{}}},
     },
     fetch:async(path,options)=>{posts.push({path,body:JSON.parse(options.body)});return{ok:true,json:async()=>({})}},
     setInterval:callback=>interval=callback,
+    clearInterval:()=>{intervalCleared=true},
   };
   vm.runInNewContext(fs.readFileSync('qoj-bridge/local-qoj.js','utf8'),context);
   await new Promise(resolve=>setImmediate(resolve));
@@ -66,6 +67,10 @@ async function localSetupTest(){
   if(qojReads!==before)throw Error('hidden setup kept polling QOJ');
   waiting=true;await interval();
   if(qojReads!==before+1)throw Error('waiting for VP start stopped QOJ detection');
+  const beforeDisconnect=qojReads;
+  disconnect();await interval();inputListener();
+  await new Promise(resolve=>setImmediate(resolve));
+  if(qojReads!==beforeDisconnect||!intervalCleared||!statusBox.textContent.includes('扩展连接已失效'))throw Error('a disconnected local reader kept polling');
 }
 
 Promise.all([backgroundFetchTest(),localSetupTest()]).then(()=>console.log('Direct authenticated QOJ fetch and local setup bridge OK')).catch(error=>{console.error(error);process.exitCode=1});

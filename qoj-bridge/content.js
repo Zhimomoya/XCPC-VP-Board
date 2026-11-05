@@ -145,7 +145,8 @@
   globalThis.xcpcOpenQojVerification=url=>bridge('VP_OPEN_QOJ_VERIFICATION',{url});
   const onQoj=/^https:\/\/(?:qoj\.ac|training\.qoj\.ac|pjudge\.ac)$/.test(location.origin);
   if(!onQoj&&!document.getElementById('qojUrl'))return;
-  let readerStarted=false;
+  let readerStarted=false,bridgeDisconnected=false;
+  document.addEventListener('xcpc-submit-bridge-disconnected',()=>{bridgeDisconnected=true});
   function startReader(){
   if(readerStarted)return;readerStarted=true;
   let lastFullSweep=0,lastFullSweepSession='',running=false,cachedMap=null,cachedMapUrl='',cachedMapAt=0,nextSyncAt=0,lastSyncSession='',lastQojOrigin='',resumeQueued=false,hasSession=false;
@@ -204,14 +205,14 @@
     return{resolved,failures,error};
   }
   async function sync(){
-    if(running)return;
+    if(running||bridgeDisconnected)return;
     running=true;
     let activeContestId='',activeSessionId='',liveListRead=false;
     try{
       const saved=await chrome.storage.local.get('handle');
       const detected=onQoj?detectHandle():'';
       let handle=detected||saved.handle||'';
-      if(detected)chrome.storage.local.set({detectedHandle:detected});
+      if(detected)await chrome.storage.local.set({detectedHandle:detected});
       const {session,submit_ids=[],submit_refs=[],pending_refs=[]}=await bridge('VP_GET_SESSION');hasSession=Boolean(session);if(!session)return;
       if(lastSyncSession!==session.session_id){lastSyncSession=session.session_id;nextSyncAt=0;pendingRows.clear();detailTimeCache.clear();sweepActive=false;sweepNextPage=2;sweepSignatures.clear()}
       for(const row of pending_refs)if(/^\d{1,15}$/.test(String(row.id))&&!pendingRows.has(String(row.id)))pendingRows.set(String(row.id),row);
@@ -224,7 +225,7 @@
       const origin=new URL(session.qoj_url).origin;
       lastQojOrigin=origin;
       const map=await currentContestMap(session.qoj_url);
-      if(!handle&&map.detectedHandle){handle=map.detectedHandle;chrome.storage.local.set({detectedHandle:handle})}
+      if(!handle&&map.detectedHandle){handle=map.detectedHandle;await chrome.storage.local.set({detectedHandle:handle})}
       const url=new URL(`/contest/${session.qoj_contest_id}/submissions`,origin);
       const fullSweep=lastFullSweepSession!==activeSessionId||syncClock()-lastFullSweep>300000;
       if(fullSweep&&!sweepActive){sweepActive=true;sweepNextPage=2;sweepSignatures.clear()}
@@ -317,12 +318,13 @@
       // Leave the sweep incomplete so old pages are revisited on recovery.
       if(fullSweep&&sweepComplete&&skippedForTimeSource===0&&detailFailures===0){lastFullSweep=syncClock();lastFullSweepSession=activeSessionId;sweepActive=false}
       const unique=[...new Map(rows.map(row=>[row.id,row])).values()];
-      chrome.storage.local.set({lastResult:`已连接并检查 ${unique.length} 条，本队累计 ${result.count} 条；本轮 ${result.changed} 条状态更新。${detailTimesResolved?`已从提交详情补全 ${detailTimesResolved} 条绝对时间。`:''}${skippedForTimeSource?`另有 ${skippedForTimeSource} 条缺少${automatic?'相对比赛时间':'绝对提交时间'}，已跳过。`:''}${unknownVerdicts.size?'其他未识别结果：'+[...unknownVerdicts].join(' / ')+'。':''}${new Date().toLocaleTimeString()}`});
+      await chrome.storage.local.set({lastResult:`已连接并检查 ${unique.length} 条，本队累计 ${result.count} 条；本轮 ${result.changed} 条状态更新。${detailTimesResolved?`已从提交详情补全 ${detailTimesResolved} 条绝对时间。`:''}${skippedForTimeSource?`另有 ${skippedForTimeSource} 条缺少${automatic?'相对比赛时间':'绝对提交时间'}，已跳过。`:''}${unknownVerdicts.size?'其他未识别结果：'+[...unknownVerdicts].join(' / ')+'。':''}${new Date().toLocaleTimeString()}`});
     }catch(error){
+      if(bridgeDisconnected||/extension context invalidated/i.test(String(error.message))){bridgeDisconnected=true;return}
       const pageOnly=liveListRead&&['verification','http'].includes(error.qojKind)&&error.qojStatus!==429&&!(error.qojStatus>=500);
       nextSyncAt=pageOnly?0:syncClock()+Math.max(2000,Number(error.retryAfterMs)||(['verification','login'].includes(error.qojKind)?5000:2000));
       const message=String(error?.message||error||'未知错误').slice(0,240);
-      chrome.storage.local.set({lastResult:'同步失败：'+message});
+      try{await chrome.storage.local.set({lastResult:'同步失败：'+message})}catch{bridgeDisconnected=true;return}
       if(activeContestId)try{await bridge('VP_POST_SYNC_ERROR',{qoj_contest_id:activeContestId,session_id:activeSessionId,error:message})}catch{}
     }
     finally{
@@ -347,6 +349,7 @@
   let registrationTimer=null;
   const register=()=>{
     if(registrationTimer!==null){clearTimeout(registrationTimer);registrationTimer=null}
+    if(bridgeDisconnected)return;
     void bridge('VP_QOJ_READER_READY').catch(error=>{
       if(/extension context invalidated/i.test(String(error.message)))return;
       registrationTimer=setTimeout(register,2000);

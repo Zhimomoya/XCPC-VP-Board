@@ -2,17 +2,22 @@
 from __future__ import annotations
 
 import errno
+import gzip
+import hashlib
 import json
+import os
 import ipaddress
 import re
 import secrets
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -34,6 +39,9 @@ SUBMISSION_SYNC_STATUS_FILE = DATA / "qoj_submission_sync_status.json"
 HISTORY_DIR = DATA / "history"
 STATE_LOCK = threading.RLock()
 CATALOG_LOCK = threading.Lock()
+CONTEST_PAYLOAD_LOCK = threading.Lock()
+CONTEST_PAYLOADS = OrderedDict()
+CONTEST_PAYLOAD_LIMIT = 32 * 1024 * 1024
 LAN_ENABLED = False
 DEBUG_ENABLED = False
 DEBUG_ELAPSED = None
@@ -154,6 +162,36 @@ def load_contest(path: str):
         # roster; newly imported/downloaded history is checked more strictly.
         result["config"].setdefault("contest_name", path)
         return normalize_xcpcio(result, allow_empty_teams=True)
+
+
+def contest_payload(path):
+    """Reuse only immutable public replay bytes; invalidate on file changes."""
+    folder = DATA / "contests" / safe_contest_path(path)
+    def signature():
+        values = []
+        for name in ("config", "team", "run", "organizations"):
+            try:
+                info = (folder / (name + ".json")).stat()
+                values.append((info.st_mtime_ns, info.st_size))
+            except FileNotFoundError:
+                values.append(None)
+        return tuple(values)
+    with CONTEST_PAYLOAD_LOCK:
+        key, revision = str(folder.resolve()), signature()
+        cached = CONTEST_PAYLOADS.get(key)
+        if cached and cached[0] == revision:
+            CONTEST_PAYLOADS.move_to_end(key)
+            return cached[1]
+        payload = json.dumps(load_contest(path), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        compressed = gzip.compress(payload, compresslevel=3, mtime=0) if len(payload) >= 4096 else None
+        result = (payload, compressed, hashlib.sha256(payload).hexdigest())
+        CONTEST_PAYLOADS.pop(key, None)
+        cost = len(payload) + len(compressed or b"")
+        if cost <= CONTEST_PAYLOAD_LIMIT and signature() == revision:
+            CONTEST_PAYLOADS[key] = (revision, result)
+            while len(CONTEST_PAYLOADS) > 2 or sum(len(value[1][0]) + len(value[1][1] or b"") for value in CONTEST_PAYLOADS.values()) > CONTEST_PAYLOAD_LIMIT:
+                CONTEST_PAYLOADS.popitem(last=False)
+        return result
 
 
 def list_contests():
@@ -1453,6 +1491,36 @@ class Handler(BaseHTTPRequestHandler):
             # response is no longer needed, so this is not a server failure.
             return None
 
+    def _contest_json(self, path):
+        payload, compressed, digest = contest_payload(path)
+        encodings = {}
+        for entry in self.headers.get("Accept-Encoding", "").lower().split(","):
+            parts = entry.strip().split(";")
+            encodings[parts[0]] = next((part.strip()[2:] for part in parts[1:] if part.strip().startswith("q=")), "1")
+        try:
+            use_gzip = compressed is not None and float(encodings.get("gzip", encodings.get("*", "0"))) > 0
+        except ValueError:
+            use_gzip = False
+        etag = '"' + digest + ("-gzip" if use_gzip else "") + '"'
+        matches = [value.strip() for value in self.headers.get("If-None-Match", "").split(",")]
+        unchanged = etag in matches or "*" in matches
+        body = compressed if use_gzip else payload
+        self.send_response(304 if unchanged else 200)
+        self.send_header("ETag", etag)
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Cache-Control", "private, no-cache")
+        if not unchanged:
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if use_gzip:
+                self.send_header("Content-Encoding", "gzip")
+        origin = self._allowed_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.end_headers()
+        if not unchanged:
+            self._write_payload(body)
+
     def do_OPTIONS(self):
         if self._allowed_origin() is None:
             return self._json({"error": "跨站请求被拒绝"}, 403)
@@ -1515,7 +1583,11 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/host-info":
                 if not self._local_client():
                     return self._json({"error": "只有主机可查看服务信息"}, 403)
-                return self._json({"lan_enabled": LAN_ENABLED, "lan_settings": lan_settings(), "lan_urls": [f"http://{address}:{self.server.server_port}" for address in lan_addresses()] if LAN_ENABLED else []})
+                value = {"process_id": os.getpid(), "project_root": str(ROOT)}
+                if query.get("identity") != ["1"]:
+                    value.update(lan_enabled=LAN_ENABLED, lan_settings=lan_settings(),
+                                 lan_urls=[f"http://{address}:{self.server.server_port}" for address in lan_addresses()] if LAN_ENABLED else [])
+                return self._json(value)
             if parsed.path == "/api/submissions":
                 with STATE_LOCK:
                     expected = query.get("session_id", [None])[0]
@@ -1546,7 +1618,7 @@ class Handler(BaseHTTPRequestHandler):
                 path = query.get("path", [""])[0]
                 if not self._local_client() and path != (session() or {}).get("path"):
                     raise PermissionError("局域网只共享当前比赛")
-                return self._json(load_contest(path))
+                return self._contest_json(path)
             if parsed.path == "/api/team-runs":
                 if not self._local_client():
                     raise PermissionError("只有主机可读取导入记录")
@@ -1702,7 +1774,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--lan", action="store_true", help="also listen on the local network")
     parser.add_argument("--debug", action="store_true", help="enable host-only contest time controls")
+    parser.add_argument("--log-dir", type=Path, help="write service output directly to this directory")
     args = parser.parse_args()
+    if args.log_dir is not None:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+        sys.stdout = (args.log_dir / f"server-windows-{args.port}.log").open("a", encoding="utf-8", buffering=1)
+        sys.stderr = (args.log_dir / f"server-windows-{args.port}.error.log").open("a", encoding="utf-8", buffering=1)
     LAN_ENABLED = args.lan
     DEBUG_ENABLED = args.debug
     host = "0.0.0.0" if args.lan else HOST

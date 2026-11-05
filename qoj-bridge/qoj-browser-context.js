@@ -28,9 +28,10 @@
       for(const [tabId,settings] of [...tabs].reverse()){
         const tab=await chrome.tabs.get(tabId).catch(()=>null);
         if(!tab||new URL(tab.url||'about:blank').origin!==target.origin||tab.pendingUrl&&new URL(tab.pendingUrl).origin!==target.origin){tabs.delete(tabId);continue}
-        let results;
+        if(tab.frozen||tab.discarded)continue;
+        let results,timer;
         try{
-          results=await chrome.scripting.executeScript({target:{tabId},func:async(url,preferDocument)=>{
+          const execution=chrome.scripting.executeScript({target:{tabId},func:async(url,preferDocument)=>{
             const target=new URL(url);
             if(location.origin!==target.origin)return{unavailable:true};
             const samePage=()=>{
@@ -53,7 +54,11 @@
             const headers={};for(const name of ['Content-Type','Retry-After','Date','cf-mitigated'])headers[name]=response.headers.get(name);
             return{url:response.url,status:response.status,ok:response.ok,redirected:response.redirected,headers,html};
           },args:[target.href,settings.preferDocument&&!networkOnly]});
+          // A suspended QOJ tab may never start its injected script or its own timer.
+          results=await Promise.race([execution,new Promise(resolve=>{timer=setTimeout(()=>resolve(null),17000)})]);
+          if(!results)break;
         }catch{tabs.delete(tabId);continue}
+        finally{if(timer)clearTimeout(timer)}
         const result=results?.[0]?.result;
         if(!result||result.unavailable){tabs.delete(tabId);continue}
         if(result.error)throw Error(result.error);

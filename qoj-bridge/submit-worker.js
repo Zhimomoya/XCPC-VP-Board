@@ -37,10 +37,29 @@ async function fetchQojHtml(url,options={}){
 async function inspectQojProblem(baseUrl,contestId,problemId,host){
   if(!/^\d{1,10}$/.test(String(problemId)))throw Error('QOJ 题目 ID 无效');
   const pathname=`/contest/${contestId}/problem/${problemId}`,url=baseUrl.origin+pathname;
-  const parsed=await parseQojInHost(host,'inspect',{...await fetchQojHtml(url,{fresh:true}),pathname});
+  const parsed=await parseQojInHost(host,'inspect',{...await fetchQojHtml(url,{fresh:true,networkOnly:true}),pathname});
   if(!parsed.ready)throw Error('未读取到 QOJ 提交表单，请检查登录或题目提交权限');
   // Tokens and native field names stay in the extension, never in page/relay replies.
   return{pathname,url,parsed,info:{ready:true,handle:parsed.handle,languages:parsed.languages,selected:parsed.selected}};
+}
+async function readQojSubmitForm(baseUrl,contestId,host,{problem_id,problem}){
+  let timer;
+  const reading=(async()=>{
+    let problemId=problem_id;
+    if(!problemId){
+      const label=String(problem||'').trim().toUpperCase();
+      if(!/^[A-Z][A-Z0-9]?$/.test(label))throw Error('请选择有效的比赛题目');
+      const mapped=await parseQojInHost(host,'problem',{...await fetchQojHtml(baseUrl.href,{fresh:true,networkOnly:true}),label});
+      problemId=mapped.problem_id;
+      if(!problemId)throw Error('未找到该题的 QOJ 对应题号，请检查比赛地址和登录状态');
+    }
+    return{...await inspectQojProblem(baseUrl,contestId,problemId,host),problemId:String(problemId)};
+  })();
+  try{
+    return await Promise.race([reading,new Promise((resolve,reject)=>{
+      timer=setTimeout(()=>reject(Error('QOJ 提交表单读取超时，代码未发送。请点 Retry 重试。')),20000);
+    })]);
+  }finally{clearTimeout(timer)}
 }
 async function readQojSource(url,host){
   const target=new URL(url);
@@ -230,11 +249,8 @@ async function processRemoteSubmissions(sender){
       if(job.action==='source'){
         value={source_details:await readQojSource(new URL('/submission/'+job.qoj_id,url).href,host)};
       }else if(job.action==='inspect'){
-        const parsed=await parseQojInHost(host,'problem',{...await fetchQojHtml(url.href),label:job.problem});
-        problemId=parsed.problem_id;
-        if(!problemId)throw Error('主机未找到该题的 QOJ 题号，请检查比赛地址和登录状态');
-        const opened=await inspectQojProblem(url,contestId,problemId,host);
-        value={info:{...opened.info,problem_id:problemId}};
+        const opened=await readQojSubmitForm(url,contestId,host,{problem:job.problem});
+        value={info:{...opened.info,problem_id:opened.problemId}};
       }else if(job.action==='rejudge'){
         value=await rejudgeQojSolution(url,contestId,job,host,async identity=>{
           const gate=await relayPost('begin',{...receipt,...identity});begun=true;return gate;
@@ -266,6 +282,7 @@ function qojContestUrl(value){
 }
 async function handleQojSubmit(message,sender){
   const host=qojHost(sender),payload=message.payload||{};
+  const started=globalThis.performance?.now?.()??Date.now();
   if(message.type==='VP_CLOSE_SUBMIT_FORM'){
     const form=qojSubmitForms.get(payload.form_key);
     if(form&&form.base===host.origin&&form.tabId===host.tabId)qojSubmitForms.delete(payload.form_key);
@@ -287,8 +304,9 @@ async function handleQojSubmit(message,sender){
   const {url,contestId}=qojContestUrl(session.qoj_url);
   if(message.type==='VP_OPEN_SUBMIT_FORM'){
     if(current.submission_window&&!current.submission_window.can_submit)throw Error(current.submission_window.reason);
-    const opened=await inspectQojProblem(url,contestId,payload.problem_id,host),key=crypto.randomUUID();
-    qojSubmitForms.set(key,{tabId:host.tabId,base:host.origin,session_id:session.session_id,problem_id:String(payload.problem_id),handle:opened.info.handle,requests:new Map()});
+    const opened=await readQojSubmitForm(url,contestId,host,payload),key=crypto.randomUUID();
+    if((globalThis.performance?.now?.()??Date.now())-started>24000)throw Error('QOJ 提交表单读取超时，代码未发送，请重新读取');
+    qojSubmitForms.set(key,{tabId:host.tabId,base:host.origin,session_id:session.session_id,problem_id:opened.problemId,handle:opened.info.handle,requests:new Map()});
     return{...opened.info,form_key:key};
   }
   const form=qojSubmitForms.get(payload.form_key);
@@ -313,6 +331,11 @@ async function handleQojSubmit(message,sender){
 }
 
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
+  if(message?.type==='VP_SUBMIT_BRIDGE_PING'){
+    try{qojHost(sender);reply({ok:true,body:{connected:true}})}
+    catch(error){reply({ok:false,error:error.message})}
+    return false;
+  }
   if(!['VP_INSPECT_QOJ_LANGUAGES','VP_OPEN_SUBMIT_FORM','VP_SEND_SOLUTION','VP_CLOSE_SUBMIT_FORM','VP_PROCESS_REMOTE_SUBMISSIONS','VP_FETCH_QOJ_SOURCE'].includes(message?.type))return false;
   (message.type==='VP_PROCESS_REMOTE_SUBMISSIONS'?processRemoteSubmissions(sender):handleQojSubmit(message,sender)).then(body=>reply({ok:true,body}),error=>reply({ok:false,error:error.message,qoj_kind:error.qojKind,retry_after_ms:error.retryAfterMs}));
   return true;
